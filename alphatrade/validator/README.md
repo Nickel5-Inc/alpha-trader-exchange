@@ -17,6 +17,25 @@ This should be saved to a .env file in the base directory.
 
 You can obtain an API key by registering at https://taostats.io. The highest tier is required for this subnet to process all transactions. We will move to on-chain handling in the future.
 
+The virtual environment can be set up with the following commands:
+
+```
+# Create a virtual environment
+python -m venv atx
+
+# Activate the virtual environment
+source atx/bin/activate
+
+# Upgrade pip
+pip install --upgrade pip
+
+# Install PyTorch
+pip install torch
+
+# Install bittensor
+pip install bittensor
+```
+
 The validator can be started with the following command:
 
-pm2 start "python neurons/validator.py --wallet.name <NAME> --wallet.hotkey <HOTKEY> --subtensor.network finney --netuid 63 --logging.trace"
+```pm2 start "python neurons/validator.py --wallet.name <NAME> --wallet.hotkey <HOTKEY> --subtensor.network finney --netuid 63 --logging.trace"```

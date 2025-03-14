@@ -143,8 +143,6 @@ class Validator(BaseValidatorNeuron):
         
         try:
             # First, ensure database is initialized
-            await self.scorer.set_weights_based_on_performance(self, min_weight_threshold=0.0001)
-            self.last_scoring = current_time
             if not hasattr(self.database, '_connection_initialized') or not self.database._connection_initialized:
                 bt.logging.info("Database not initialized, initializing now...")
                 await self.database.setup_database()

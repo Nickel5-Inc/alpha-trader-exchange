@@ -1,0 +1,144 @@
+Below is a detailed plan (with pseudocode) for a full refactor of the DatabaseManager class. The goal is to encapsulate all the low‐level connection, locking, and transaction management into helper methods that can be reused by all read/write operations. This will:
+• Reduce duplicated code
+• Isolate connection and error handling logic
+• Make the higher-level business methods (e.g., registering a miner, adding a position, processing a trade) cleaner and more maintainable
+–––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––
+Create Helper Methods for Connection and Transaction Handling
+a. Read Query Helper
+• Define run_read_query(query, params) that:
+– Opens a connection (via get_connection)
+– Executes the query with parameters
+– Fetches and returns the result rows
+– Catches any exception, wraps it in DatabaseError, and returns an error
+Pseudocode:
+-------------------------------------------------
+async def run_read_query(query: str, params: tuple = ()) -> list:
+try:
+async with self.get_connection() as conn:
+cursor = await conn.execute(query, params)
+rows = await cursor.fetchall()
+return rows
+except Exception as e:
+raise DatabaseError(f"Read query failed: {str(e)}")
+-------------------------------------------------
+b. Write Query Helper
+• Define run_write_query(query, params, commit=True) that:
+– Acquires the write lock (self.write_lock)
+– Opens a connection (via get_connection)
+– Begins a transaction (for example, using "BEGIN IMMEDIATE")
+– Executes the query with parameters
+– Commits the transaction if commit is True
+– Returns the cursor
+– On error, rolls back and wraps the exception
+Pseudocode:
+-------------------------------------------------
+async def run_write_query(query: str, params: tuple = (), commit: bool = True) -> aiosqlite.Cursor:
+async with self.write_lock:
+async with self.get_connection() as conn:
+try:
+await conn.execute("BEGIN IMMEDIATE")
+cursor = await conn.execute(query, params)
+if commit:
+await conn.commit()
+return cursor
+except Exception as e:
+try:
+await conn.rollback()
+except Exception:
+pass
+raise DatabaseError(f"Write query failed: {str(e)}")
+-------------------------------------------------
+c. Transaction Helper
+• Define run_transaction(txn_func) which:
+– Acquires the write lock and opens a connection.
+– Begins a transaction
+– Invokes the provided coroutine function txn_func(conn).
+– On success, commits and returns the value from txn_func.
+– On exception, rolls back and raises a DatabaseError.
+Pseudocode:
+-------------------------------------------------
+async def run_transaction(self, txn_func) -> any:
+async with self.write_lock:
+async with self.get_connection() as conn:
+try:
+await conn.execute("BEGIN IMMEDIATE")
+result = await txn_func(conn)
+await conn.commit()
+return result
+except Exception as e:
+try:
+await conn.rollback()
+except Exception:
+pass
+raise DatabaseError(f"Transaction failed: {str(e)}")
+-------------------------------------------------
+–––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––
+2. Refactor Methods to Use the Helper Methods
+a. register_miner
+• Remove explicit connection handling and use run_transaction:
+– Define an inner coroutine (txn) that queries if the miner exists and inserts a new miner.
+– Call miner_uid = await self.run_transaction(txn)
+– Then, outside the transaction, call create_miner_tables(hotkey)
+Pseudocode:
+-------------------------------------------------
+async def register_miner(...):
+# Validate inputs and set defaults
+async def txn(conn):
+# Check for existing miner
+# If exists, raise ValidationError
+# Insert new miner into miners table
+# Return cursor.lastrowid or uid depending on parameter
+miner_uid = await self.run_transaction(txn)
+await self.create_miner_tables(hotkey)
+return miner_uid
+-------------------------------------------------
+b. add_position
+• Similarly, refactor add_position to use run_transaction:
+– Define txn(conn) that validates referential integrity, inserts a position, updates miner stats, and returns position ID.
+– Add retry logic (with exponential backoff) outside the helper.
+Pseudocode:
+-------------------------------------------------
+async def add_position(...):
+retry_count = 0; max_retries = 3
+while True:
+try:
+async def txn(conn):
+# Validate referential integrity (call validate_referential_integrity)
+# INSERT INTO position table and update miner stats
+# Return new position ID
+return await self.run_transaction(txn)
+except Exception as e:
+# If error indicates "database is locked", retry with delay
+# else, raise error
+-------------------------------------------------
+c. process_close and Other Write Operations
+• Refactor methods that perform multiple write steps (process_close, update_miner_status, archive_closed_positions, etc.) to either:
+– Wrap the entire set of operations in a single run_transaction call
+– Or use the run_write_query helper for single-statement updates
+• This will remove repeated code that manually acquires the write lock and handles transactions.
+d. Read Methods
+• Refactor get_open_positions, get_miner, get_trade, etc., to call run_read_query with the appropriate SQL and parameters.
+–––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––
+Update Error Handling and Logging
+• Make sure that each helper method catches exceptions and rethrows them as DatabaseError.
+• Update existing methods to check for specific exceptions (e.g., sqlite3.OperationalError) and implement exponential backoff for "database is locked" errors.
+• Log each retry attempt with details.
+–––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––
+Testing and Incremental Rollout
+• Once the helper methods are implemented, update one method at a time to call them.
+• Ensure test coverage remains complete:
+– Run unit tests (e.g., test_validator.py) after each refactoring stage.
+– Confirm that the behavior (for registrations, position additions, trade processing) stays consistent.
+• Use the existing test fixtures to verify the refactor does not break the functionality.
+–––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––
+Document the Changes
+• Update inline comments and possibly developer documentation to describe the new architecture.
+• Explain how the helper methods centralize connection management and error handling.
+–––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––
+In summary, the refactor plan is to:
+Introduce three helper methods (run_read_query, _run_write_query, _run_transaction) that handle connection creation, locking, and error management.
+Refactor high-level methods (register_miner, add_position, process_close, etc.) to use these helpers instead of manually managing connections and locks.
+3. Refactor all read-only query methods to use the run_read_query helper.
+4. Ensure robust error handling with exponential backoff for database locks.
+Test thoroughly after each incremental change.
+This plan keeps all existing logic and special methods intact while modularizing the connection and transaction handling code, making future maintenance and potential migrations (such as to SQLAlchemy async) easier.

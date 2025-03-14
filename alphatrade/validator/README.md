@@ -10,7 +10,7 @@ TAOSTATS_API_URL=https://api.taostats.io
 
 # API Key for TaoStats (required for authenticated endpoints)
 # Format: tao-{uuid}:{secret}
-TAOSTATS_API_KEY=tao-44658c1e-7dce-41ef-ac6b-15942665440e:ef1cc958
+TAOSTATS_API_KEY=...
 ```
 
 This should be saved to a .env file in the base directory. 

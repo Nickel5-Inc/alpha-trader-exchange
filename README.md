@@ -26,7 +26,7 @@
 
 ## Introduction
 
-The Alpha Trade Exchange Subnet is designed to incentivize and promote liquidity across alpha token pools in the Bittensor network. This subnet creates a unique ecosystem where:
+The Alpha Trader Exchange Subnet is designed to incentivize and promote liquidity across alpha token pools in the Bittensor network. This subnet creates a unique ecosystem where:
 
 - Miners earn rewards by executing profitable trades between alpha tokens
 - Validators track and score trading performance

@@ -29,6 +29,9 @@ source atx/bin/activate
 # Upgrade pip
 pip install --upgrade pip
 
+# Install sqlalchemy
+pip install sqlalchemy
+
 # Install PyTorch
 pip install torch
 

@@ -28,7 +28,7 @@ import bittensor as bt
 from alphatrade.validator.validator import Validator
 
 # Function to periodically run the main method
-async def run_main_loop(validator, interval_seconds=3600):
+async def run_main_loop(validator, interval_seconds=5400):
     """
     Run the validator's main maintenance loop periodically.
     
@@ -54,6 +54,7 @@ async def run_main_loop(validator, interval_seconds=3600):
             bt.logging.error(f"Stack Trace: {stack_trace}")
             
         # Sleep before the next run
+        bt.logging.info("Sleeping for 45 minutes. This is normal behavior")
         await asyncio.sleep(interval_seconds)
 
 def main():

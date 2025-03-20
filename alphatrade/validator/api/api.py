@@ -123,7 +123,7 @@ class AlphaAPI:
                 
                 if response.status == 429:  # Too Many Requests
                     retry_after = int(response.headers.get('Retry-After', 60))
-                    bt.logging.warning(f"Rate limit exceeded. Waiting {retry_after} seconds...")
+                    bt.logging.warning(f"Rate limit exceeded. Waiting {retry_after} seconds... This is expected.")
                     await asyncio.sleep(retry_after)
                     return await self._make_request(endpoint, params)
                 

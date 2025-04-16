@@ -11,6 +11,7 @@ Features:
 - Maintains database consistency across sync operations
 - Ignores trades for coldkeys registered on specific subnets
 - Prevents duplicate API calls for the same coldkey
+- Uses TaoApp API for fetching stake events
 """
 
 import asyncio
@@ -37,7 +38,7 @@ class SyncManager:
         api_client: AlphaAPI,
         metagraph,
         sync_interval_minutes: int = 15,
-        min_blocks_for_trade: int = 360
+        min_blocks_for_trade: int = 0
     ):
         """Initialize the sync manager.
         
@@ -47,22 +48,22 @@ class SyncManager:
             api_client: Alpha API client instance
             metagraph: Bittensor metagraph
             sync_interval_minutes: Minutes between syncs
-            min_blocks_for_trade: Minimum blocks required for valid trades
+            min_blocks_for_trade: Minimum blocks required for valid trades (set to 0)
         """
         self.database = database
         self.miner_manager = miner_manager
         self.api = api_client
         self.metagraph = metagraph
         self.sync_interval = timedelta(minutes=sync_interval_minutes)
-        self.min_blocks = min_blocks_for_trade
+        self.min_blocks = min_blocks_for_trade  # Set to 0
         
         # Track last sync times
         self.last_global_sync = datetime.min.replace(tzinfo=timezone.utc)
         
-        # Cache for miner sync times to reduce DB lookups
+        # Cache for miner sync times
         self._miner_sync_cache = {}
         
-        # Cache for miner coldkeys to reduce DB lookups
+        # Cache for miner coldkeys
         self._miner_coldkey_cache = {}
         
         # Track processed event extrinsic IDs to avoid duplicates
@@ -81,9 +82,9 @@ class SyncManager:
         self._subnet_registrations = {}
         
         # List of subnets to check for registrations
-        self.subnet_range = range(1, 75)  # Subnets 1-74
+        self.subnet_range = range(1, 85)  # Subnets 1-85
         
-        bt.logging.info("SyncManager initialized successfully")
+        bt.logging.info("SyncManager initialized successfully with min_blocks=0")
     
     async def ensure_initialized(self):
         """Ensure database and miner manager are initialized."""
@@ -478,7 +479,6 @@ class SyncManager:
         
         try:
             async with self.database.connection.get_connection() as conn:
-                # Check if last_sync column exists
                 cursor = await conn.execute(
                     "PRAGMA table_info(miners)"
                 )
@@ -572,7 +572,6 @@ class SyncManager:
         # Sort events by timestamp to ensure proper order
         events.sort(key=lambda e: e.timestamp)
         
-        # Improved approach for handling multiple events with same extrinsic_id
         # Group events by extrinsic_id
         extrinsic_groups = {}
         for event in events:
@@ -812,13 +811,12 @@ class SyncManager:
                 self._processed_events.add(event.extrinsic_id)
                 return
         
-        # Get open positions for this netuid
         try:
             async with self.database.connection.get_connection() as conn:
                 cursor = await conn.execute(
                     f"""
                     SELECT * FROM miner_{miner_uid}_positions
-                    WHERE status = 'open' AND netuid = ?
+                    WHERE (status = 'open' OR status = 'partial') AND netuid = ?
                     ORDER BY entry_timestamp ASC
                     """,
                     (event.netuid,)
@@ -827,13 +825,18 @@ class SyncManager:
                 rows = await cursor.fetchall()
                 
                 for row in rows:
+                    # Ensure timestamps are timezone-aware
+                    entry_timestamp = datetime.fromisoformat(row['entry_timestamp'])
+                    if entry_timestamp.tzinfo is None:
+                        entry_timestamp = entry_timestamp.replace(tzinfo=timezone.utc)
+                        
                     positions.append(Position(
                         position_id=row['position_id'],
                         miner_uid=miner_uid,
                         netuid=row['netuid'],
                         hotkey=row['hotkey'],
                         entry_block=row['entry_block'],
-                        entry_timestamp=datetime.fromisoformat(row['entry_timestamp']),
+                        entry_timestamp=entry_timestamp,
                         entry_tao=row['entry_tao'],
                         entry_alpha=row['entry_alpha'],
                         remaining_alpha=row['remaining_alpha'],
@@ -841,16 +844,17 @@ class SyncManager:
                         extrinsic_id=row['extrinsic_id']
                     ))
             
-            # Check if we have any open positions for this netuid
+            # Check if we have any open or partial positions for this netuid
             if not positions:
-                bt.logging.info(f"Ignoring unstake event {event.extrinsic_id} for netuid {event.netuid}: no open positions found")
+                bt.logging.info(f"Ignoring unstake event {event.extrinsic_id} for netuid {event.netuid}: no open or partial positions found")
                 # Mark as processed to avoid reprocessing
                 self._processed_events.add(event.extrinsic_id)
                 return
-                
+                    
             # Get hotkey from metagraph using UID for consistency
             miner_hotkey = self.metagraph.hotkeys[miner_uid]
             
+            # For StakeRemoved (UNDELEGATE): amount_in is TAO, amount_out is ALPHA
             trade = Trade(
                 trade_id=None,  # Will be set by database
                 miner_uid=miner_uid,
@@ -863,9 +867,8 @@ class SyncManager:
                 extrinsic_id=event.extrinsic_id
             )
             
-            # Process close
             await self.database.process_close(miner_uid, trade, positions, self.min_blocks)
-            bt.logging.info(f"Closed {len(positions)} positions for miner {miner_uid}, extrinsic_id: {event.extrinsic_id}")
+            bt.logging.info(f"Closed positions for miner {miner_uid}, extrinsic_id: {event.extrinsic_id}")
             
             # Mark as processed
             self._processed_events.add(event.extrinsic_id)

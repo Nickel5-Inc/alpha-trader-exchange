@@ -5,17 +5,17 @@
 The API client is configured using environment variables:
 
 ```
-# API URL for TaoStats
-TAOSTATS_API_URL=https://api.taostats.io
+# API URL for Taoapp
+https://api.tao.app/
 
-# API Key for TaoStats (required for authenticated endpoints)
+# API Key for Taoapp (required for authenticated endpoints)
 # Format: tao-{uuid}:{secret}
-TAOSTATS_API_KEY=...
+TAOAPP_API_KEY=...
 ```
 
 This should be saved to a .env file in the base directory. 
 
-You can obtain an API key by registering at https://taostats.io. The highest tier is required for this subnet to process all transactions. We will move to on-chain handling in the future.
+You can obtain an API key by registering at https://api.tao.app . The highest tier is required for this subnet to process all transactions. We will move to on-chain handling in the future.
 
 The virtual environment can be set up with the following commands:
 

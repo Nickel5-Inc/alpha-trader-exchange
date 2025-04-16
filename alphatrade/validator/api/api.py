@@ -2,7 +2,7 @@ import asyncio
 import aiohttp
 import logging
 import bittensor as bt
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Dict, List, Optional, Any, Tuple, Set
 import pandas as pd
 
@@ -10,7 +10,7 @@ from alphatrade.validator.database.models import StakeAction, StakeEvent, ApiTra
 from alphatrade.utils.env import get_env, load_env
 
 class AlphaAPI:
-    """Client for interacting with Alpha Token Trading APIs."""
+    """Client for interacting with Tao App APIs."""
     
     def __init__(
         self, 
@@ -20,18 +20,18 @@ class AlphaAPI:
         """Initialize the API client.
         
         Args:
-            base_url: Base URL for the API. If None, uses the TAOSTATS_API_URL environment variable
-                     or falls back to the default "https://api.taostats.io".
-            api_key: API key for authentication. If None, uses the TAOSTATS_API_KEY environment variable.
+            base_url: Base URL for the API. If None, uses the TAO_APP_API_URL environment variable
+                     or falls back to the default "https://api.tao.app".
+            api_key: API key for authentication. If None, uses the TAOAPP_API_KEY environment variable.
         """
         # Load environment variables if not already loaded
         load_env()
         
         # Set base URL from args, env var, or default
-        self.base_url = base_url or get_env('TAOSTATS_API_URL', 'https://api.taostats.io')
+        self.base_url = base_url or get_env('TAO_APP_API_URL', 'https://api.tao.app')
         
         # Set API key from args or env var
-        self.api_key = api_key or get_env('TAOSTATS_API_KEY', '')
+        self.api_key = api_key or get_env('TAOAPP_API_KEY', '')
         
         self.session: Optional[aiohttp.ClientSession] = None
         self._rate_limit_remaining = 100
@@ -78,22 +78,18 @@ class AlphaAPI:
                 await asyncio.sleep(wait_time)
         
         url = f"{self.base_url}/{endpoint}"
-        # bt.logging.info(f"Making request to {url}")
         
-        # Prepare headers with API key if available
+        # Prepare headers with API key
         headers = {
-            "accept": "application/json"
+            "accept": "application/json",
+            "X-API-Key": self.api_key
         }
-        if self.api_key:
-            # Use the API key directly as the Authorization header value
-            headers['Authorization'] = self.api_key
-            # bt.logging.info(f"Using API key: ****{self.api_key[-8:] if len(self.api_key) > 8 else ''}")
             
         try:
             async with self.session.get(url, params=params, headers=headers) as response:
                 # Update rate limit info if headers are present
                 if 'X-RateLimit-Remaining' in response.headers:
-                    self._rate_limit_remaining = int(response.headers.get('X-RateLimit-Remaining', 100))
+                    self._rate_limit_remaining = int(response.headers.get('X-RateLimit-Remaining', 1000))
                 if 'X-RateLimit-Reset' in response.headers:
                     self._rate_limit_reset = int(response.headers.get('X-RateLimit-Reset', 0))
                 
@@ -153,7 +149,7 @@ class AlphaAPI:
         start_time: Optional[datetime] = None,
         end_time: Optional[datetime] = None,
         page: int = 1,
-        per_page: int = 100
+        per_page: int = 1000
     ) -> List[StakeEvent]:
         """Fetch stake/unstake events for a specific coldkey.
         
@@ -168,95 +164,105 @@ class AlphaAPI:
             List[StakeEvent]: List of stake events
         """
         params = {
-            'nominator': coldkey,  # API expects 'nominator' parameter
+            'coldkey': coldkey,
             'page': page,
-            'per_page': per_page
+            'page_size': per_page
         }
-        if start_time:
-            params['start_time'] = int(start_time.timestamp())
-        if end_time:
-            params['end_time'] = int(end_time.timestamp())
+        
+        # Ensure start_time and end_time are timezone-aware if provided
+        if start_time and start_time.tzinfo is None:
+            start_time = start_time.replace(tzinfo=timezone.utc)
+        
+        if end_time and end_time.tzinfo is None:
+            end_time = end_time.replace(tzinfo=timezone.utc)
         
         all_events = []
         try:
-            # Use the correct endpoint
-            endpoint = 'api/delegation/v1'
+            endpoint = 'api/beta/portfolio/transactions'
             
             data = await self._make_request(endpoint, params)
-            
-            # Get pagination info and data length
-            pagination = data.get('pagination', {})
-            total_items = pagination.get('total_items', 0)
-            
-            # Only log if there are actual items to process
-            if total_items > 0 and page == 1:
-                bt.logging.info(f"First API response for coldkey {coldkey}: {pagination}")
             
             # Process events from current page
             page_events = []
             for event_data in data.get('data', []):
                 try:
-                    # Safely convert values with defensive error handling
-                    # Default to 0 if any value is None
-                    try:
-                        amount = float(event_data.get('amount', 0)) / 1e9
-                    except (TypeError, ValueError):
-                        amount = 0
-                        
-                    try:
-                        alpha = float(event_data.get('alpha', 0)) / 1e9
-                    except (TypeError, ValueError):
-                        alpha = 0
-                        
-                    try:
-                        alpha_price_tao = float(event_data.get('alpha_price_in_tao', 0))
-                    except (TypeError, ValueError):
-                        alpha_price_tao = 0
-                        
-                    try:
-                        alpha_price_usd = float(event_data.get('alpha_price_in_usd', 0))
-                    except (TypeError, ValueError):
-                        alpha_price_usd = 0
-                        
-                    try:
-                        usd_amount = float(event_data.get('usd', 0))
-                    except (TypeError, ValueError):
-                        usd_amount = 0
-                    
-                    # Safely get nominator/delegate SS58 addresses
-                    nominator = event_data.get('nominator', {})
-                    delegate = event_data.get('delegate', {})
-                    
-                    nominator_ss58 = nominator.get('ss58') if isinstance(nominator, dict) else coldkey
-                    delegate_ss58 = delegate.get('ss58') if isinstance(delegate, dict) else ""
-                    
-                    # Map API action to our StakeAction enum
-                    action_str = event_data.get('action', 'DELEGATE')
-                    action = StakeAction.DELEGATE if action_str == 'DELEGATE' else StakeAction.UNDELEGATE
-                    
-                    # Format timestamp, defaulting to current time if missing
+                    # Parse timestamp
                     timestamp_str = event_data.get('timestamp')
                     if timestamp_str:
-                        timestamp = datetime.fromisoformat(timestamp_str.replace('Z', '+00:00'))
+                        try:
+                            # Parse timestamp and ensure it's timezone-aware
+                            timestamp = datetime.fromisoformat(timestamp_str.replace('Z', '+00:00'))
+                            if timestamp.tzinfo is None:  # If timezone info is missing
+                                timestamp = timestamp.replace(tzinfo=timezone.utc)
+                        except ValueError:
+                            # Fallback if parsing fails
+                            bt.logging.warning(f"Failed to parse timestamp: {timestamp_str}, using current time")
+                            timestamp = datetime.now(timezone.utc)
                     else:
-                        timestamp = datetime.now()
+                        timestamp = datetime.now(timezone.utc)
                     
-                    # Get extrinsic ID - use a default if not present
-                    extrinsic_id = event_data.get('extrinsic_id', f"missing-{timestamp.isoformat()}-{nominator_ss58}")
+                    # Filter by timestamp if needed
+                    if start_time and timestamp < start_time:
+                        continue
+                    if end_time and timestamp > end_time:
+                        continue
                     
+                    # Map event_id to our StakeAction enum
+                    event_id = event_data.get('event_id', '').lower()
+                    if event_id == 'stakeadded':
+                        action = StakeAction.DELEGATE
+                    elif event_id == 'stakeremoved':
+                        action = StakeAction.UNDELEGATE
+                    else:
+                        # Skip unknown event types
+                        continue
+                    
+                    # Convert values with defensive error handling
+                    try:
+                        netuid = int(event_data.get('netuid', 0))
+                    except (TypeError, ValueError):
+                        netuid = 0
+                        
+                    try:
+                        # For StakeAdded: amount_in is TAO, amount_out is ALPHA
+                        # For StakeRemoved: amount_in is ALPHA, amount_in is TAO
+                        if action == StakeAction.DELEGATE:  # StakeAdded
+                            tao_amount = float(event_data.get('amount_in', 0))
+                            alpha_amount = float(event_data.get('amount_out', 0))
+                        else:  # StakeRemoved
+                            alpha_amount = float(event_data.get('amount_out', 0))
+                            tao_amount = float(event_data.get('amount_in', 0))
+                    except (TypeError, ValueError):
+                        tao_amount = 0
+                        alpha_amount = 0
+                    
+                    # Calculate price (for reference only)
+                    price = 0
+                    if action == StakeAction.DELEGATE and alpha_amount > 0:
+                        price = tao_amount / alpha_amount
+                    elif action == StakeAction.UNDELEGATE and alpha_amount > 0:
+                        price = tao_amount / alpha_amount
+                    
+                    # Extract hotkey or use default
+                    hotkey = event_data.get('hotkey', '')
+                    
+                    # Get extrinsic ID from the event data
+                    extrinsic_id = event_data.get('extrinsics', f"missing-{timestamp.isoformat()}-{coldkey}")
+                    
+                    # Create StakeEvent object
                     page_events.append(StakeEvent(
-                        block_number=event_data.get('block_number', 0),
+                        block_number=0,
                         timestamp=timestamp,
-                        netuid=event_data.get('netuid', 0),
+                        netuid=netuid,
                         action=action,
-                        coldkey=nominator_ss58,
-                        hotkey=delegate_ss58,
-                        tao_amount=amount,
-                        alpha_amount=alpha,
+                        coldkey=coldkey,
+                        hotkey=hotkey,
+                        tao_amount=tao_amount,
+                        alpha_amount=alpha_amount,
                         extrinsic_id=extrinsic_id,
-                        alpha_price_in_tao=alpha_price_tao,
-                        alpha_price_in_usd=alpha_price_usd,
-                        usd_amount=usd_amount
+                        alpha_price_in_tao=price,
+                        alpha_price_in_usd=0,  # USD price not provided in the new API
+                        usd_amount=0  # USD amount not provided in the new API
                     ))
                 except Exception as e:
                     bt.logging.warning(f"Error processing event: {str(e)}")
@@ -265,107 +271,123 @@ class AlphaAPI:
             # Add current page events to all events
             all_events.extend(page_events)
             
-            # Handle pagination using a non-recursive approach
-            next_page = pagination.get('next_page')
-            total_pages = pagination.get('total_pages', 1)
+            # Handle pagination
+            next_page = data.get('next_page')
+            total = data.get('total', 0)
+            total_pages = (total // per_page) + (1 if total % per_page > 0 else 0) if total > 0 else 1
             
-            if total_items > 0 and page == 1:
+            if len(page_events) > 0:
                 bt.logging.info(f"Fetched {len(page_events)} stake events for {coldkey} (page {page}/{total_pages})")
             
             # If there are more pages to fetch, use a non-recursive approach
-            if next_page and page < total_pages and total_items > 0:
-                try:
-                    # Start a loop to fetch additional pages
-                    current_page = next_page
-                    while current_page and current_page <= total_pages:
-                        # Update page parameter
-                        params['page'] = current_page
-                        
-                        # Log progress for every 5th page or last page
-                        if current_page % 5 == 0 or current_page == total_pages:
-                            bt.logging.info(f"Fetching page {current_page} of {total_pages} for coldkey {coldkey}")
-                        
-                        # Make request for next page
-                        next_data = await self._make_request(endpoint, params)
-                        next_pagination = next_data.get('pagination', {})
-                        
-                        # Process events from this page with error handling
-                        for event_data in next_data.get('data', []):
+            current_page = next_page
+            while current_page and int(current_page) <= total_pages:
+                # Update page parameter
+                params['page'] = current_page
+                
+                # Log progress for every 5th page or last page
+                if int(current_page) % 5 == 0 or int(current_page) == total_pages:
+                    bt.logging.info(f"Fetching page {current_page} of {total_pages} for coldkey {coldkey}")
+                
+                # Make request for next page
+                next_data = await self._make_request(endpoint, params)
+                
+                # Process events from this page
+                next_page_events = []
+                for event_data in next_data.get('data', []):
+                    try:
+                        # Parse timestamp
+                        timestamp_str = event_data.get('timestamp')
+                        if timestamp_str:
                             try:
-                                # Safely convert values with defensive error handling
-                                try:
-                                    amount = float(event_data.get('amount', 0)) / 1e9
-                                except (TypeError, ValueError):
-                                    amount = 0
-                                    
-                                try:
-                                    alpha = float(event_data.get('alpha', 0)) / 1e9
-                                except (TypeError, ValueError):
-                                    alpha = 0
-                                    
-                                try:
-                                    alpha_price_tao = float(event_data.get('alpha_price_in_tao', 0))
-                                except (TypeError, ValueError):
-                                    alpha_price_tao = 0
-                                    
-                                try:
-                                    alpha_price_usd = float(event_data.get('alpha_price_in_usd', 0))
-                                except (TypeError, ValueError):
-                                    alpha_price_usd = 0
-                                    
-                                try:
-                                    usd_amount = float(event_data.get('usd', 0))
-                                except (TypeError, ValueError):
-                                    usd_amount = 0
-                                
-                                # Safely get nominator/delegate SS58 addresses
-                                nominator = event_data.get('nominator', {})
-                                delegate = event_data.get('delegate', {})
-                                
-                                nominator_ss58 = nominator.get('ss58') if isinstance(nominator, dict) else coldkey
-                                delegate_ss58 = delegate.get('ss58') if isinstance(delegate, dict) else ""
-                                
-                                # Map API action to our StakeAction enum
-                                action_str = event_data.get('action', 'DELEGATE')
-                                action = StakeAction.DELEGATE if action_str == 'DELEGATE' else StakeAction.UNDELEGATE
-                                
-                                # Format timestamp, defaulting to current time if missing
-                                timestamp_str = event_data.get('timestamp')
-                                if timestamp_str:
-                                    timestamp = datetime.fromisoformat(timestamp_str.replace('Z', '+00:00'))
-                                else:
-                                    timestamp = datetime.now()
-                                
-                                # Get extrinsic ID - use a default if not present
-                                extrinsic_id = event_data.get('extrinsic_id', f"missing-{timestamp.isoformat()}-{nominator_ss58}")
-                                
-                                all_events.append(StakeEvent(
-                                    block_number=event_data.get('block_number', 0),
-                                    timestamp=timestamp,
-                                    netuid=event_data.get('netuid', 0),
-                                    action=action,
-                                    coldkey=nominator_ss58,
-                                    hotkey=delegate_ss58,
-                                    tao_amount=amount,
-                                    alpha_amount=alpha,
-                                    extrinsic_id=extrinsic_id,
-                                    alpha_price_in_tao=alpha_price_tao,
-                                    alpha_price_in_usd=alpha_price_usd,
-                                    usd_amount=usd_amount
-                                ))
-                            except Exception as e:
-                                bt.logging.warning(f"Error processing event on page {current_page}: {str(e)}")
-                                continue
+                                # Parse timestamp and ensure it's timezone-aware
+                                timestamp = datetime.fromisoformat(timestamp_str.replace('Z', '+00:00'))
+                                if timestamp.tzinfo is None:  # If timezone info is missing
+                                    timestamp = timestamp.replace(tzinfo=timezone.utc)
+                            except ValueError:
+                                # Fallback if parsing fails
+                                bt.logging.warning(f"Failed to parse timestamp: {timestamp_str}, using current time")
+                                timestamp = datetime.now(timezone.utc)
+                        else:
+                            timestamp = datetime.now(timezone.utc)
                         
-                        # Move to next page if available
-                        current_page = next_pagination.get('next_page')
+                        # Filter by timestamp if needed
+                        if start_time and timestamp < start_time:
+                            continue
+                        if end_time and timestamp > end_time:
+                            continue
                         
-                    # Log final count for all fetched events
-                    if total_items > per_page:
-                        bt.logging.info(f"Completed fetching all {len(all_events)} stake events for {coldkey}")
-                except Exception as e:
-                    bt.logging.error(f"Error during pagination: {str(e)}")
-                    # Continue with the events already fetched
+                        # Map event_id to our StakeAction enum
+                        event_id = event_data.get('event_id', '').lower()
+                        if event_id == 'stakeadded':
+                            action = StakeAction.DELEGATE
+                        elif event_id == 'stakeremoved':
+                            action = StakeAction.UNDELEGATE
+                        else:
+                            # Skip unknown event types
+                            continue
+                        
+                        # Convert values with defensive error handling
+                        try:
+                            netuid = int(event_data.get('netuid', 0))
+                        except (TypeError, ValueError):
+                            netuid = 0
+                            
+                        try:
+                            # For StakeAdded: amount_in is TAO, amount_out is ALPHA
+                            # For StakeRemoved: amount_in is ALPHA, amount_out is TAO
+                            if action == StakeAction.DELEGATE:
+                                tao_amount = float(event_data.get('amount_in', 0))
+                                alpha_amount = float(event_data.get('amount_out', 0))
+                            else:  # UNDELEGATE
+                                alpha_amount = float(event_data.get('amount_out', 0))
+                                tao_amount = float(event_data.get('amount_in', 0))
+                        except (TypeError, ValueError):
+                            tao_amount = 0
+                            alpha_amount = 0
+                        
+                        # Calculate alpha price in TAO
+                        alpha_price_tao = 0
+                        if action == StakeAction.DELEGATE and alpha_amount > 0:
+                            alpha_price_tao = tao_amount / alpha_amount
+                        elif action == StakeAction.UNDELEGATE and alpha_amount > 0:
+                            alpha_price_tao = tao_amount / alpha_amount
+                        
+                        # Extract hotkey from the event data or use a default
+                        hotkey = event_data.get('hotkey', '')
+                        
+                        # Get extrinsic ID from the event data
+                        extrinsic_id = event_data.get('extrinsics', f"missing-{timestamp.isoformat()}-{coldkey}")
+                        
+                        # Create StakeEvent object
+                        next_page_events.append(StakeEvent(
+                            block_number=0,  # Block number not provided in the new API
+                            timestamp=timestamp,
+                            netuid=netuid,
+                            action=action,
+                            coldkey=coldkey,
+                            hotkey=hotkey,
+                            tao_amount=tao_amount,
+                            alpha_amount=alpha_amount,
+                            extrinsic_id=extrinsic_id,
+                            alpha_price_in_tao=alpha_price_tao,
+                            alpha_price_in_usd=0,  # USD price not provided in the new API
+                            usd_amount=0  # USD amount not provided in the new API
+                        ))
+                    except Exception as e:
+                        bt.logging.warning(f"Error processing event on page {current_page}: {str(e)}")
+                        continue
+                
+                # Add next page events to all events
+                all_events.extend(next_page_events)
+                
+                # Move to next page if available
+                next_page = next_data.get('next_page')
+                current_page = next_page
+            
+            # Log final count for all fetched events
+            if len(all_events) > per_page:
+                bt.logging.info(f"Completed fetching all {len(all_events)} stake events for {coldkey}")
         
         except Exception as e:
             bt.logging.error(f"Failed to fetch stake events: {str(e)}")
@@ -383,13 +405,17 @@ class AlphaAPI:
         Returns:
             Set[int]: Set of netuids with active positions
         """
+        # Ensure timestamp is timezone-aware
+        if timestamp.tzinfo is None:
+            timestamp = timestamp.replace(tzinfo=timezone.utc)
+            
         params = {
             'coldkey': coldkey,
-            'end_time': int(timestamp.timestamp()),
-            'per_page': 1000
+            'page': 1,
+            'page_size': 1000
         }
         
-        data = await self._make_request('api/dtao/delegation/v1', params)
+        data = await self._make_request('api/beta/portfolio/transactions', params)
         
         # Get data length
         total_items = len(data.get('data', []))
@@ -401,12 +427,35 @@ class AlphaAPI:
         # Track active positions
         active_positions = set()
         
-        for event in sorted(data['data'], key=lambda x: x['block_number']):
-            netuid = event['netuid']
-            if event['action'] == StakeAction.STAKE_ADDED.value:
-                active_positions.add(netuid)
-            elif event['action'] == StakeAction.STAKE_REMOVED.value and netuid in active_positions:
-                active_positions.remove(netuid)
+        # Sort events by timestamp
+        events = sorted(data.get('data', []), key=lambda x: x.get('timestamp', ''))
+        
+        for event in events:
+            # Parse timestamp and ensure it's timezone-aware
+            event_timestamp_str = event.get('timestamp', '')
+            try:
+                event_timestamp = datetime.fromisoformat(event_timestamp_str.replace('Z', '+00:00'))
+                if event_timestamp.tzinfo is None:
+                    event_timestamp = event_timestamp.replace(tzinfo=timezone.utc)
+            except ValueError:
+                bt.logging.warning(f"Failed to parse timestamp: {event_timestamp_str}, skipping event")
+                continue
+                
+            # Skip events after the specified timestamp
+            if event_timestamp > timestamp:
+                continue
+                
+            try:
+                netuid = int(event.get('netuid', 0))
+                event_id = event.get('event_id', '').lower()
+                
+                if event_id == 'stakeadded':
+                    active_positions.add(netuid)
+                elif event_id == 'stakeremoved' and netuid in active_positions:
+                    active_positions.remove(netuid)
+            except (ValueError, TypeError) as e:
+                bt.logging.warning(f"Error processing event for active positions: {str(e)}")
+                continue
         
         # Only log active positions if there are any
         if active_positions:
@@ -429,6 +478,10 @@ class AlphaAPI:
         Returns:
             List[ApiTrade]: List of processed trades
         """
+        # Ensure start_tracking_time is timezone-aware
+        if start_tracking_time.tzinfo is None:
+            start_tracking_time = start_tracking_time.replace(tzinfo=timezone.utc)
+            
         # Sort events by timestamp
         events = sorted(events, key=lambda x: x.timestamp)
         
@@ -497,11 +550,10 @@ class AlphaAPI:
             List[PoolData]: List of pool information
         """
         try:
-            # Use the correct endpoint provided by the user
-            endpoint = 'api/dtao/pool/latest/v1'
+            # Use the correct endpoint for the new API
+            endpoint = 'api/beta/network/pools'
             params = {
-                'netuid': netuid,
-                'page': 1
+                'netuid': netuid
             }
             
             data = await self._make_request(endpoint, params)
@@ -518,19 +570,18 @@ class AlphaAPI:
                 try:
                     # Extract pool data based on the actual response format
                     pools.append(PoolData(
-                        netuid=pool['netuid'],
-                        tao_reserve=float(pool['total_tao']) / 1e9,  # Convert from nano-TAO
-                        alpha_reserve=float(pool['alpha_in_pool']) / 1e9,  # Convert from nano-alpha
-                        alpha_supply=float(pool['total_alpha']) / 1e9,  # Convert from nano-alpha
-                        emission_rate=0.0,  # Not provided in the response
-                        price=float(pool['price'])
+                        netuid=pool.get('netuid', 0),
+                        tao_reserve=float(pool.get('tao_reserve', 0)),
+                        alpha_reserve=float(pool.get('alpha_reserve', 0)),
+                        alpha_supply=float(pool.get('alpha_supply', 0)),
+                        emission_rate=float(pool.get('emission_rate', 0.0)),
+                        price=float(pool.get('price', 0.0))
                     ))
                     
                 except (KeyError, ValueError) as e:
                     bt.logging.warning(f"Error processing pool data: {str(e)}")
                     continue
             
-            # Only log pool count if there are pools
             if pools:
                 bt.logging.info(f"Fetched data for {len(pools)} pools")
             return pools
@@ -554,8 +605,12 @@ class AlphaAPI:
         Returns:
             Dict[str, Any]: Performance metrics including ROI, volume, etc.
         """
-        end_time = datetime.now()
-        start_time = end_time - timedelta(days=1)
+        # Ensure start_tracking_from is timezone-aware
+        if start_tracking_from.tzinfo is None:
+            start_tracking_from = start_tracking_from.replace(tzinfo=timezone.utc)
+            
+        end_time = datetime.now(timezone.utc)
+        start_time = end_time - timedelta(days=7)  # Get one week of data
         
         # Get events and process trades
         events = await self.get_stake_events(coldkey, start_time, end_time)

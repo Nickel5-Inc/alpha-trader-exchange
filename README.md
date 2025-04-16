@@ -8,7 +8,7 @@
 
 ## The Incentivized Alpha Token Trading Network <!-- omit in toc -->
 
-[Discord](https://discord.gg/bittensor) • [Network](https://taostats.io/) • [Research](https://bittensor.com/whitepaper)
+[Discord](https://discord.gg/bittensor) • [Research](https://bittensor.com/whitepaper)
 </div>
 
 ---

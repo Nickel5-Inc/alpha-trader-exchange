@@ -309,21 +309,22 @@ class DatabaseManager:
         miner_uid: int, 
         trade: Trade, 
         positions: List[Position],
-        min_blocks: int = 360
+        min_blocks: int = 0
     ) -> List[PositionTrade]:
         """Process a close event against a list of open positions using strict FIFO.
         
+        This method implements proper FIFO trading with partial position handling:
+        1. First fully close any partially open positions (oldest first)
+        2. Then partially close newer positions as needed
+        
         Args:
             miner_uid: Miner's UID
-            trade: Trade data representing the close event
+            trade: Trade data representing the close event (StakeRemoved)
             positions: List of open positions to match against
-            min_blocks: Minimum blocks required for valid trade (default 360)
+            min_blocks: Minimum blocks required for valid trade (default 0)
             
         Returns:
             List[PositionTrade]: List of position-trade relationships created
-            
-        Raises:
-            DatabaseError: If database operations fail
         """
         if not positions:
             return []
@@ -359,13 +360,18 @@ class DatabaseManager:
         # Create Position objects from database rows if any found
         from_db_partials = []
         for row in partial_rows:
+            # Ensure timestamp is timezone-aware
+            entry_timestamp = datetime.fromisoformat(row['entry_timestamp'])
+            if entry_timestamp.tzinfo is None:
+                entry_timestamp = entry_timestamp.replace(tzinfo=timezone.utc)
+                
             pos = Position(
                 position_id=row[0],
                 miner_uid=row[1],
                 netuid=row[2],
                 hotkey=row[3],
                 entry_block=row[4],
-                entry_timestamp=datetime.fromisoformat(row[5]),
+                entry_timestamp=entry_timestamp,
                 entry_tao=row[6],
                 entry_alpha=row[7],
                 remaining_alpha=row[8],
@@ -374,16 +380,16 @@ class DatabaseManager:
             )
             from_db_partials.append(pos)
         
-        # Combine database partials with any partial positions in the provided list
+        # First include partial positions, then open positions sorted by entry timestamp (FIFO)
         partial_positions = from_db_partials
         partial_positions += [p for p in positions if p.status == PositionStatus.PARTIAL 
                             and p.position_id not in [x.position_id for x in partial_positions]]
         
-        # First include partial positions, then open positions sorted by entry timestamp
+        # Get open positions sorted by entry timestamp
         open_positions = [p for p in positions if p.status == PositionStatus.OPEN]
         open_positions.sort(key=lambda p: p.entry_timestamp)
         
-        # Combine partial and open positions in the correct order
+        # Combine partial and open positions in the correct order (oldest partial first, then oldest open)
         ordered_positions = partial_positions + open_positions
         
         # Log positions being processed
@@ -444,6 +450,8 @@ class DatabaseManager:
                     
                     # HANDLE SELF-TRADES: If this position has the same extrinsic_id as the trade
                     if position.extrinsic_id == trade.extrinsic_id:
+                        bt.logging.info(f"Handling self-trade for position {position.position_id}")
+                        
                         # For self-trades, calculate the absolute TAO difference
                         tao_gain_loss = trade.exit_tao - position.entry_tao
                         
@@ -458,14 +466,14 @@ class DatabaseManager:
                             trade_id=trade.trade_id,
                             alpha_amount=alpha_to_close,
                             tao_amount=trade.exit_tao,
-                            roi_tao=tao_gain_loss,  # Absolute TAO gain/loss
-                            duration=0,  # Self-trades are effectively immediate
+                            roi_tao=tao_gain_loss,
+                            duration=0,
                             min_blocks_met=True
                         )
                         
                         position.remaining_alpha = 0
                         position.status = PositionStatus.CLOSED
-                        position.closed_at = position.entry_timestamp  # Use entry time for consistency
+                        position.closed_at = position.entry_timestamp
                         position.final_roi = tao_gain_loss
                         
                         # Save the position trade mapping
@@ -509,59 +517,37 @@ class DatabaseManager:
                     
                     # STANDARD PROCESSING FOR NON-SELF-TRADES
                     
-                    # When closing an entire position
-                    if abs(position.remaining_alpha - alpha_to_close) < 1e-6:
-                        # Direct calculation for complete close
-                        # Calculate what fraction of the trade this position represents
-                        trade_fraction = alpha_to_close / trade.exit_alpha if trade.exit_alpha > 0 else 0
-                        
-                        # Calculate the TAO value for this position
-                        tao_portion = trade_fraction * trade.exit_tao
-                        
-                        # Absolute TAO gain/loss (not a percentage)
-                        tao_gain_loss = tao_portion - position.entry_tao
-                        
-                        # Log calculation details
-                        bt.logging.info(f"Full position close: TAO gain/loss for position {position.position_id}: " +
-                                    f"{tao_portion} - {position.entry_tao} = {tao_gain_loss} TAO")
-                    else:
-                        # For partial closes, use proportional calculation
-                        # Calculate what fraction of the position we're closing
-                        position_fraction = alpha_to_close / position.entry_alpha if position.entry_alpha > 0 else 0
-                        
-                        # Calculate proportional entry TAO amount for this portion
-                        entry_tao_portion = position.entry_tao * position_fraction
-                        
-                        # Calculate what fraction of the trade's alpha this position represents
-                        trade_fraction = alpha_to_close / trade.exit_alpha if trade.exit_alpha > 0 else 0
-                        
-                        # Use proportional allocation of exit TAO
-                        tao_portion = trade_fraction * trade.exit_tao
-                        
-                        # Absolute TAO gain/loss (not a percentage)
-                        tao_gain_loss = tao_portion - entry_tao_portion
-                        
-                        # Log calculation details
-                        bt.logging.info(f"Partial position close: TAO gain/loss for position {position.position_id}: " +
-                                    f"{tao_portion} - {entry_tao_portion} = {tao_gain_loss} TAO")
+                    # For partial close
+                    position_alpha_ratio = alpha_to_close / position.entry_alpha
+                    entry_tao_portion = position.entry_tao * position_alpha_ratio
+
+                    # Calculate what fraction of the exit this position represents
+                    trade_alpha_ratio = alpha_to_close / trade.exit_alpha
+                    exit_tao_portion = trade.exit_tao * trade_alpha_ratio
+
+                    # ROI is the difference
+                    tao_gain_loss = exit_tao_portion - entry_tao_portion
                     
-                    # Check if minimum blocks requirement is met
+                    # Log calculation details
+                    bt.logging.info(f"Position {position.position_id} close calculation: " +
+                                f"Entry: {entry_tao_portion} TAO for {alpha_to_close} alpha, " +
+                                f"Exit: {exit_tao_portion} TAO, Gain/Loss: {tao_gain_loss} TAO")
+                    
+                    # Check if minimum blocks requirement is met (always true since min_blocks=0)
                     blocks_held = trade.exit_block - position.entry_block
-                    min_blocks_met = blocks_held >= min_blocks
+                    min_blocks_met = True
                     
-                    # If minimum blocks not met, set gain/loss to 0
-                    if not min_blocks_met:
-                        bt.logging.info(f"Position {position.position_id} doesn't meet min blocks requirement ({blocks_held} < {min_blocks}), setting gain/loss to 0")
-                        tao_gain_loss = 0.0
+                    # Calculate duration
+                    duration = int((trade.exit_timestamp - position.entry_timestamp).total_seconds())
                     
                     # Create position trade record
                     position_trade = PositionTrade(
                         position_id=position.position_id,
                         trade_id=trade.trade_id,
                         alpha_amount=alpha_to_close,
-                        tao_amount=tao_portion,
-                        roi_tao=tao_gain_loss,  # Now absolute TAO gain/loss
-                        duration=int((trade.exit_timestamp - position.entry_timestamp).total_seconds()),
+                        tao_amount=exit_tao_portion,
+                        roi_tao=tao_gain_loss,
+                        duration=duration,
                         min_blocks_met=min_blocks_met
                     )
                     
@@ -576,7 +562,7 @@ class DatabaseManager:
                         """,
                         (
                             position.position_id, trade_id, alpha_to_close,
-                            tao_portion, tao_gain_loss, position_trade.duration, min_blocks_met
+                            exit_tao_portion, tao_gain_loss, position_trade.duration, min_blocks_met
                         )
                     )
                     
@@ -593,43 +579,48 @@ class DatabaseManager:
                         position.final_roi = tao_gain_loss
                         
                         bt.logging.info(f"Position {position.position_id} is now fully closed with TAO gain/loss of {tao_gain_loss}")
+                        
+                        # Update position in database - fully closed
+                        await conn.execute(
+                            f"""
+                            UPDATE miner_{miner_uid}_positions
+                            SET remaining_alpha = 0,
+                                status = 'closed',
+                                closed_at = ?,
+                                final_roi = ?
+                            WHERE position_id = ?
+                            """,
+                            (
+                                position.closed_at.isoformat() if position.closed_at else None,
+                                position.final_roi,
+                                position.position_id
+                            )
+                        )
                     else:
                         # Position is partially closed
                         position.status = PositionStatus.PARTIAL
-                        position.closed_at = None
-                        position.final_roi = None
                         
                         bt.logging.info(f"Position {position.position_id} is partially closed: {position.remaining_alpha} alpha remaining")
-                    
-                    # Update position in database
-                    await conn.execute(
-                        f"""
-                        UPDATE miner_{miner_uid}_positions
-                        SET remaining_alpha = ?,
-                            status = ?,
-                            closed_at = ?,
-                            final_roi = ?
-                        WHERE position_id = ?
-                        """,
-                        (
-                            position.remaining_alpha,
-                            position.status.value,
-                            position.closed_at.isoformat() if position.closed_at else None,
-                            position.final_roi,
-                            position.position_id
+                        
+                        # Update position in database - partially closed
+                        await conn.execute(
+                            f"""
+                            UPDATE miner_{miner_uid}_positions
+                            SET remaining_alpha = ?,
+                                status = 'partial'
+                            WHERE position_id = ?
+                            """,
+                            (
+                                position.remaining_alpha,
+                                position.position_id
+                            )
                         )
-                    )
                     
                     position_trades.append(position_trade)
                     
                     # Update remaining amounts
                     remaining_alpha -= alpha_to_close
-                    remaining_tao -= tao_portion
-                    
-                    # If this position is partial, stop processing to maintain FIFO
-                    if position.status == PositionStatus.PARTIAL:
-                        bt.logging.info(f"Position {position.position_id} is partial, stopping FIFO processing")
-                        break
+                    remaining_tao -= exit_tao_portion
                 
                 # Update miner stats
                 await self._update_miner_stats_with_min_blocks(miner_uid, conn, min_blocks)
@@ -854,8 +845,16 @@ class DatabaseManager:
         except Exception as e:
             bt.logging.error(f"Error updating miner stats: {str(e)}")
 
-    async def _update_miner_stats_with_min_blocks(self, miner_uid: int, conn, min_blocks: int = 360):
-        """Update miner statistics with consideration for minimum blocks requirement."""
+    async def _update_miner_stats_with_min_blocks(self, miner_uid: int, conn, min_blocks: int = 0):
+        """Update miner statistics with consideration for minimum blocks requirement.
+        
+        This method calculates accurate ROI and other statistics based on position trades.
+        
+        Args:
+            miner_uid: Miner's UID
+            conn: Database connection
+            min_blocks: Minimum blocks required for valid trade (default 0)
+        """
         try:
             # Count total trades
             cursor = await conn.execute(
@@ -879,13 +878,13 @@ class DatabaseManager:
             total_tao = volume[0] if volume and volume[0] else 0.0
             total_alpha = volume[1] if volume and volume[1] else 0.0
 
-            # Calculate ROI stats - only consider trades that met minimum blocks requirement
+            # Calculate total TAO gain/loss from all position trades
             cursor = await conn.execute(
                 f"""
                 SELECT 
                     SUM(pt.roi_tao) as total_tao_gain_loss,
-                    SUM(CASE WHEN pt.roi_tao > 0 AND pt.min_blocks_met = 1 THEN 1 ELSE 0 END) * 100.0 / 
-                        NULLIF(COUNT(CASE WHEN pt.min_blocks_met = 1 THEN 1 END), 0) as win_rate,
+                    COUNT(CASE WHEN pt.roi_tao > 0 THEN 1 END) as profitable_trades,
+                    COUNT(*) as total_position_trades,
                     AVG(pt.duration) as avg_duration
                 FROM miner_{miner_uid}_position_trades pt
                 WHERE pt.min_blocks_met = 1
@@ -893,12 +892,18 @@ class DatabaseManager:
             )
             roi_stats = await cursor.fetchone()
             
-            # Get total TAO gain/loss (not percentage)
+            # Get net TAO gain/loss (not percentage ROI)
             total_tao_gain_loss = roi_stats[0] if roi_stats and roi_stats[0] is not None else 0.0
-            win_rate = roi_stats[1] if roi_stats and roi_stats[1] is not None else 0.0
-            avg_duration = roi_stats[2] if roi_stats and roi_stats[2] is not None else 0
+            profitable_trades = roi_stats[1] if roi_stats and roi_stats[1] is not None else 0
+            total_position_trades = roi_stats[2] if roi_stats and roi_stats[2] is not None else 0
+            
+            # Calculate win rate
+            win_rate = (profitable_trades / total_position_trades * 100) if total_position_trades > 0 else 0.0
+            
+            # Average trade duration
+            avg_duration = roi_stats[3] if roi_stats and roi_stats[3] is not None else 0
 
-            # Count current open positions
+            # Count current open and partial positions
             cursor = await conn.execute(
                 f"""
                 SELECT COUNT(*) FROM miner_{miner_uid}_positions
@@ -927,7 +932,7 @@ class DatabaseManager:
                     total_trades,
                     total_tao,
                     total_alpha,
-                    total_tao_gain_loss,  # Changed from percentage to absolute value
+                    total_tao_gain_loss,
                     avg_duration,
                     win_rate,
                     current_positions,
@@ -938,7 +943,7 @@ class DatabaseManager:
 
             bt.logging.info(
                 f"Updated miner {miner_uid} stats: trades={total_trades}, tao={total_tao:.2f}, "
-                f"alpha={total_alpha:.2f}, total_tao_gain_loss={total_tao_gain_loss:.9f} TAO, win_rate={win_rate:.2f}%, "
+                f"alpha={total_alpha:.2f}, net_tao_gain_loss={total_tao_gain_loss:.6f}, win_rate={win_rate:.2f}%, "
                 f"positions={current_positions}"
             )
         except Exception as e:

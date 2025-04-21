@@ -9,7 +9,6 @@ The API client is configured using environment variables:
 https://api.tao.app/
 
 # API Key for Taoapp (required for authenticated endpoints)
-# Format: tao-{uuid}:{secret}
 TAOAPP_API_KEY=...
 ```
 
